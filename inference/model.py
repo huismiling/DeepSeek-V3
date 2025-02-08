@@ -8,6 +8,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 
 from kernel import act_quant, weight_dequant, fp8_gemm
+from kernel import weight_dequant_fi8 as weight_dequant
 
 
 world_size = 1
@@ -126,7 +127,7 @@ class ParallelEmbedding(nn.Module):
         return y
 
 
-def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None, weight_scale: Optional[torch.Tensor] = None) -> torch.Tensor:
     """
     Applies a linear transformation to the incoming data: y = xA^T + b.
     This function supports specialized implementations based on quantization
@@ -151,7 +152,7 @@ def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] =
     if weight.element_size() > 1:
         return F.linear(x, weight, bias)
     elif gemm_impl == "bf16":
-        weight = weight_dequant(weight, weight.scale)
+        weight = weight_dequant(weight, weight_scale)
         return F.linear(x, weight, bias)
     else:
         x, scale = act_quant(x, block_size)
@@ -173,11 +174,15 @@ class Linear(nn.Module):
     """
     dtype = torch.bfloat16
 
-    def __init__(self, in_features: int, out_features: int, bias: bool = False, dtype = None):
+    def __init__(self, in_features: int, out_features: int, bias: bool = False, dtype = None, weight_device="cuda"):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=dtype or Linear.dtype))
+        wdtype= dtype or Linear.dtype
+        if wdtype is torch.float8_e4m3fn :
+            weight_device = "cpu"
+            wdtype = torch.int8
+        self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=wdtype, device=weight_device), requires_grad=False)
         if self.weight.element_size() == 1:
             scale_out_features = (out_features + block_size - 1) // block_size
             scale_in_features = (in_features + block_size - 1) // block_size
@@ -189,6 +194,11 @@ class Linear(nn.Module):
         else:
             self.register_parameter("bias", None)
 
+    def load_state_dict(self, state_dict,
+                        strict: bool = True, assign: bool = False):
+        super().load_state_dict(state_dict, strict, assign)
+        self.weight = self.weight.view(torch.int8).cuda()
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass for the custom linear layer.
@@ -199,7 +209,7 @@ class Linear(nn.Module):
         Returns:
             torch.Tensor: Transformed tensor after linear computation.
         """
-        return linear(x, self.weight, self.bias)
+        return linear(x, self.weight, self.bias, weight_scale=self.scale)
 
 
 class ColumnParallelLinear(Linear):
@@ -227,7 +237,7 @@ class ColumnParallelLinear(Linear):
         Returns:
             torch.Tensor: Transformed tensor with column-parallel computation.
         """
-        y = linear(x, self.weight, self.bias)
+        y = linear(x, self.weight, self.bias, weight_scale=self.scale)
         return y
 
 
@@ -256,7 +266,7 @@ class RowParallelLinear(Linear):
         Returns:
             torch.Tensor: Transformed tensor with row-parallel computation.
         """
-        y = linear(x, self.weight)
+        y = linear(x, self.weight, weight_scale=self.scale)
         if world_size > 1:
             dist.all_reduce(y)
         if self.bias is not None:
@@ -604,7 +614,7 @@ class Expert(nn.Module):
         w2 (nn.Module): Linear layer for hidden-to-output transformation.
         w3 (nn.Module): Additional linear layer for feature transformation.
     """
-    def __init__(self, dim: int, inter_dim: int):
+    def __init__(self, dim: int, inter_dim: int, weight_device="cuda"):
         """
         Initializes the Expert layer.
 
@@ -613,9 +623,9 @@ class Expert(nn.Module):
             inter_dim (int): Hidden layer dimensionality.
         """
         super().__init__()
-        self.w1 = Linear(dim, inter_dim)
-        self.w2 = Linear(inter_dim, dim)
-        self.w3 = Linear(dim, inter_dim)
+        self.w1 = Linear(dim, inter_dim, weight_device=weight_device)
+        self.w2 = Linear(inter_dim, dim, weight_device=weight_device)
+        self.w3 = Linear(dim, inter_dim, weight_device=weight_device)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -659,8 +669,9 @@ class MoE(nn.Module):
         self.experts_start_idx = rank * self.n_local_experts
         self.experts_end_idx = self.experts_start_idx + self.n_local_experts
         self.gate = Gate(args)
-        self.experts = nn.ModuleList([Expert(args.dim, args.moe_inter_dim) if self.experts_start_idx <= i < self.experts_end_idx else None
-                                      for i in range(self.n_routed_experts)])
+        self.experts = nn.ModuleList([Expert(args.dim, args.moe_inter_dim, weight_device="cpu") 
+                                        if self.experts_start_idx <= i < self.experts_end_idx else None
+                                        for i in range(self.n_routed_experts)])
         self.shared_experts = MLP(args.dim, args.n_shared_experts * args.moe_inter_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -783,8 +794,9 @@ class Transformer(nn.Module):
         mask = None
         if seqlen > 1:
             mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device).triu_(1)
-        for layer in self.layers:
-            h = layer(h, start_pos, freqs_cis, mask)
+        for itn, layer in enumerate(self.layers):
+            with torch.profiler.record_function(f"layer_{itn}"):
+                h = layer(h, start_pos, freqs_cis, mask)
         h = self.norm(h)[:, -1]
         logits = self.head(h)
         if world_size > 1:

@@ -4,6 +4,12 @@ from argparse import ArgumentParser
 from typing import List
 
 import torch
+try:
+    import torch_mlu
+    import torch_mlu.utils.gpu_migration
+except Exception as Err:
+    print(f"Failed import torch_mlu, {Err}")
+
 import torch.distributed as dist
 from transformers import AutoTokenizer
 from safetensors.torch import load_model
